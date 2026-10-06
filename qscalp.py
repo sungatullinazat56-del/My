@@ -242,6 +242,65 @@ def iter_quotes(path):
         yield frame + _MSK_MS, changes
 
 
+STREAM_ORDLOG = 0x70
+# OrdLog action flags (uint16), see the QSH spec, section 4.7
+ORD_ADD, ORD_FILL, ORD_BUY, ORD_SELL = 1 << 2, 1 << 3, 1 << 4, 1 << 5
+ORD_CANCELED, ORD_MOVED, ORD_COUNTER = 1 << 13, 1 << 12, 1 << 8
+
+
+def read_ordlog(path):
+    """Full exchange order log (FORTS_ORDLOG_REPL): one row per order operation.
+
+    Columns: ts, order_id, actions (bit flags, see ORD_*), side (1 buy / 2 sell), price,
+    amount (volume of the operation), rest (order remainder, set on fills and adds),
+    deal_id, deal_price, oi. ``ts`` is exchange (Moscow) time.
+    """
+    h, r = _open(path)
+    if h.stream_type != STREAM_ORDLOG:
+        raise ValueError(f"{path}: not an OrdLog stream")
+    frame = h.created_ticks // 10000
+    ts = last_add = price = amount = rest = deal_id = deal_price = oi = 0
+    rows = []
+    while not r.eof:
+        frame = r.growing(frame)
+        avail = r.byte()
+        actions = r.byte() | (r.byte() << 8)
+        is_add = actions & ORD_ADD
+        if avail & 1:
+            ts = r.growing(ts)
+        if not avail & 2:
+            order_id = last_add
+        elif is_add:
+            last_add = r.growing(last_add)
+            order_id = last_add
+        else:
+            order_id = r.relative(last_add)
+        if avail & 4:
+            price = r.relative(price)
+        if avail & 8:
+            amount = r.leb()
+        if actions & ORD_FILL:
+            if avail & 16:
+                rest = r.leb()
+            if avail & 32:
+                deal_id = r.growing(deal_id)
+            if avail & 64:
+                deal_price = r.relative(deal_price)
+            if avail & 128:
+                oi = r.relative(oi)
+            row_rest, row_deal, row_dprice, row_oi = rest, deal_id, deal_price, oi
+        else:
+            row_rest, row_deal, row_dprice, row_oi = (amount if is_add else 0), 0, 0, 0
+        side = 1 if actions & ORD_BUY else (2 if actions & ORD_SELL else 0)
+        rows.append((ts, order_id, actions, side, price, amount, row_rest, row_deal, row_dprice, row_oi))
+    df = pd.DataFrame(rows, columns=["ts", "order_id", "actions", "side", "price", "amount", "rest",
+                                     "deal_id", "deal_price", "oi"])
+    df["ts"] = _EPOCH + pd.to_timedelta(df["ts"], unit="ms")
+    df["price"] = (df["price"] * h.price_step).round(10)
+    df["deal_price"] = (df["deal_price"] * h.price_step).round(10)
+    return df
+
+
 def deals_ms(deals):
     """Deal timestamps as Moscow-time milliseconds since 0001-01-01 (same scale as iter_quotes)."""
     return ((deals["ts"] - _EPOCH) // pd.Timedelta(milliseconds=1)).to_numpy()
