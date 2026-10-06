@@ -221,6 +221,32 @@ def read_quotes(path, depth=1):
     return df
 
 
+def iter_quotes(path):
+    """Yield ``(ts_ms, changes)`` for every Quotes frame, with the full set of level changes.
+
+    ``ts_ms`` is Moscow-time milliseconds since 0001-01-01 and ``changes`` is a list of
+    ``(price_in_steps, signed_volume)``: positive volume is ask, negative is bid, zero
+    removes the level. Price step is in ``read_header(path).price_step``.
+    """
+    h, r = _open(path)
+    if h.stream_type != STREAM_QUOTES:
+        raise ValueError(f"{path}: not a Quotes stream")
+    frame = h.created_ticks // 10000
+    last_price = 0
+    while not r.eof:
+        frame = r.growing(frame)
+        changes = []
+        for _ in range(r.leb()):
+            last_price = r.relative(last_price)
+            changes.append((last_price, r.leb()))
+        yield frame + _MSK_MS, changes
+
+
+def deals_ms(deals):
+    """Deal timestamps as Moscow-time milliseconds since 0001-01-01 (same scale as iter_quotes)."""
+    return ((deals["ts"] - _EPOCH) // pd.Timedelta(milliseconds=1)).to_numpy()
+
+
 def candles(deals, rule="1min"):
     """OHLCV candles from a deals frame."""
     g = deals.set_index("ts")
